@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -432,6 +434,69 @@ def open_file(folder, base_name):
         )
     except Exception as e:
         QMessageBox.critical(None, "Ошибка", str(e))
+
+
+class ScanWorker(QObject):
+    """Сканирует папку в фоне, отдаёт прогресс через сигналы."""
+
+    progress = Signal(int, int, str)  # (done, total, current_file)
+    finished = Signal(int, list)  # (processed, errors)
+    cancelled = Signal(int, list)  # (processed, errors)
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self._folder = folder
+        self._stop = threading.Event()
+
+    def cancel(self):
+        self._stop.set()
+
+    def run(self):
+        """Вызывается из отдельного threading.Thread."""
+        errors: list[tuple[str, str]] = []
+        processed = 0
+
+        # ---- фаза 1: собрать список файлов ----
+        paths: list[str] = []
+        for root, _, files in os.walk(self._folder):
+            if self._stop.is_set():
+                self.cancelled.emit(processed, errors)
+                return
+            for name in files:
+                if name.endswith(".bnf"):
+                    paths.append(os.path.join(root, name))
+
+        total = len(paths)
+        self.progress.emit(0, total, "")
+        if total == 0:
+            self.finished.emit(0, errors)
+            return
+
+        # ---- фаза 2: обработать ----
+        for i, path in enumerate(paths, start=1):
+            if self._stop.is_set():
+                self.cancelled.emit(processed, errors)
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                add_or_update_book(
+                    data.get("title", ""),
+                    data.get("orig_name", ""),
+                    data.get("author", ""),
+                    data.get("description", ""),
+                    data.get("lang"),
+                    data.get("favorite", False),
+                    path,
+                    data.get("tags", []),
+                )
+                processed += 1
+            except Exception as e:
+                errors.append((path, str(e)))
+            self.progress.emit(i, total, os.path.basename(path))
+
+        check_db_files_exist()
+        self.finished.emit(processed, errors)
 
 
 # ---------- Watcher-адаптер ----------
@@ -1219,6 +1284,8 @@ class LibraryApp(QMainWindow):
         self.settings = QSettings("BookLibrary", "LibraryManager")
         self.dark_theme = self.settings.value("ui/dark_theme", False, type=bool)
 
+        self._scan_worker: ScanWorker | None = None
+
         self.history_path = os.path.join(
             os.path.expanduser("~"), ".bnf_tag_history.json"
         )
@@ -1327,6 +1394,17 @@ class LibraryApp(QMainWindow):
         # статус
         self.status_label = QLabel("Готово")
         self.statusBar().addWidget(self.status_label, 1)
+
+        self.scan_progress = QProgressBar()
+        self.scan_progress.setFixedWidth(200)
+        self.scan_progress.setVisible(False)
+        self.statusBar().addPermanentWidget(self.scan_progress)
+
+        self.scan_cancel_btn = QPushButton("Отмена")
+        self.scan_cancel_btn.setFixedWidth(70)
+        self.scan_cancel_btn.setVisible(False)
+        self.scan_cancel_btn.clicked.connect(self._cancel_scan)
+        self.statusBar().addPermanentWidget(self.scan_cancel_btn)
 
         # Горячие клавиши
         # QShortcut(QKeySequence("Return"), self.table, activated=self._open_from_table)
@@ -1731,40 +1809,88 @@ class LibraryApp(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
         if not folder:
             return
-        self.status_label.setText("Сканирование...")
-        threading.Thread(target=self._scan_worker, args=(folder,), daemon=True).start()
+        self._start_scan(folder)
 
-    def _scan_worker(self, folder):
-        count = 0
-        for root, _, files in os.walk(folder):
-            for file in files:
-                if file.endswith(".bnf"):
-                    try:
-                        with open(os.path.join(root, file), "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        add_or_update_book(
-                            data.get("title", ""),
-                            data.get("orig_name", ""),
-                            data.get("author", ""),
-                            data.get("description", ""),
-                            data.get("lang"),
-                            data.get("favorite", False),
-                            os.path.join(root, file),
-                            data.get("tags", []),
-                        )
-                        count += 1
-                    except Exception as e:
-                        print(f"Ошибка {file}: {e}")
-        check_db_files_exist()
-        QTimer.singleShot(0, lambda: self._scan_done(count))
+    def _start_scan(self, folder: str):
+        if getattr(self, "_scan_worker", None) is not None:
+            return  # уже идёт
 
-    def _scan_done(self, count):
+        self._scan_worker = ScanWorker(folder)
+        self._scan_worker.progress.connect(self._on_scan_progress)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.cancelled.connect(self._on_scan_cancelled)
+
+        self.scan_progress.setRange(0, 0)  # «бегунок» пока не знаем total
+        self.scan_progress.setVisible(True)
+        self.scan_cancel_btn.setVisible(True)
+        self.status_label.setText("Сканирование…")
+
+        threading.Thread(target=self._scan_worker.run, daemon=True).start()
+
+    def _on_scan_progress(self, done: int, total: int, name: str):
+        if total <= 0:
+            self.scan_progress.setRange(0, 0)
+            return
+        if self.scan_progress.maximum() != total:
+            self.scan_progress.setRange(0, total)
+        self.scan_progress.setValue(done)
+        self.status_label.setText(f"Сканирование: {done}/{total}  {name}")
+
+    def _on_scan_finished(self, processed: int, errors: list):
+        self._scan_cleanup()
         self.refresh_books()
-        QMessageBox.information(
-            self, "Сканирование", f"Добавлено или обновлено {count} книг"
-        )
+        self.status_label.setText(f"Сканирование завершено: {processed} книг")
+        if errors:
+            self._show_scan_errors(processed, errors)
+        else:
+            QMessageBox.information(
+                self,
+                "Сканирование",
+                f"Добавлено или обновлено {processed} книг",
+            )
+
+    def _on_scan_cancelled(self, processed: int, errors: list):
+        self._scan_cleanup()
+        self.refresh_books()
+        self.status_label.setText(f"Сканирование отменено ({processed} обработано)")
+        if errors:
+            self._show_scan_errors(processed, errors)
+
+    def _cancel_scan(self):
+        if getattr(self, "_scan_worker", None) is not None:
+            self._scan_worker.cancel()
+            self.status_label.setText("Отмена…")
+
+    def _scan_cleanup(self):
+        self._scan_worker = None
+        self.scan_progress.setVisible(False)
+        self.scan_cancel_btn.setVisible(False)
+        self.scan_progress.setRange(0, 100)
+        self.scan_progress.setValue(0)
+
+    def _show_scan_errors(self, processed: int, errors: list):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Сканирование: ошибки")
+        dlg.resize(900, 500)
+
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Обработано: {processed}. Ошибок: {len(errors)}."))
+
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText("\n".join(f"{p}: {e}" for p, e in errors))
+        lay.addWidget(txt, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+
+        dlg.exec()
 
     def closeEvent(self, event):
+        if getattr(self, "_scan_worker", None) is not None:
+            self._scan_worker.cancel()
         self.watcher.stop()
         super().closeEvent(event)
 
