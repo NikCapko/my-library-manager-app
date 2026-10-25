@@ -10,10 +10,11 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from pathlib import Path
 from contextlib import contextmanager
-from PySide6.QtCore import QObject, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,9 +26,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -185,6 +188,7 @@ def db():
     finally:
         conn.close()
 
+
 def init_db():
     with db() as conn:
         cur = conn.cursor()
@@ -209,9 +213,12 @@ def init_db():
             )
         """)
 
+
 def save_tags(book_id, tags):
     with db() as conn:
         cur = conn.cursor()
+        # синхронизируем набор: удаляем лишние, добавляем недостающие
+        cur.execute("DELETE FROM book_tags WHERE book_id=?", (book_id,))
         for tag in tags:
             tag = tag.strip()
             if not tag:
@@ -228,42 +235,85 @@ def save_tags(book_id, tags):
 def get_tags_for_book(book_id):
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT name FROM tags
             JOIN book_tags ON tags.id = book_tags.tag_id
             WHERE book_tags.book_id=?
-        """, (book_id,))
+        """,
+            (book_id,),
+        )
         return [row[0] for row in cur.fetchall()]
 
 
 def find_book_id(title, author):
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id FROM books
             WHERE UNI_LOWER(title) = UNI_LOWER(?)
               AND UNI_LOWER(author) = UNI_LOWER(?)
-        """, (title, author))
+        """,
+            (title, author),
+        )
         row = cur.fetchone()
         return row[0] if row else None
 
 
-def add_or_update_book(title, orig_name, author, description, lang=None,
-                       favorite=False, bnf_path=None, tags=None):
-    book_id = find_book_id(title, author)
+def add_or_update_book(
+    title,
+    orig_name,
+    author,
+    description,
+    lang=None,
+    favorite=False,
+    bnf_path=None,
+    tags=None,
+):
+    # 1) приоритет — уникальный путь к файлу
+    book_id = None
+    if bnf_path:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM books WHERE bnf_path=?", (bnf_path,))
+            row = cur.fetchone()
+            if row:
+                book_id = row[0]
+
+    # 2) fallback — по title+author (для импорта «с нуля» без файла)
+    if book_id is None:
+        book_id = find_book_id(title, author)
+
     with db() as conn:
         cur = conn.cursor()
         if book_id:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE books SET title=?, orig_name=?, author=?, description=?,
                                  lang=?, favorite=?, bnf_path=? WHERE id=?
-            """, (title, orig_name, author, description, lang, favorite, bnf_path, book_id))
+            """,
+                (
+                    title,
+                    orig_name,
+                    author,
+                    description,
+                    lang,
+                    favorite,
+                    bnf_path,
+                    book_id,
+                ),
+            )
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO books (title, orig_name, author, description, lang, favorite, bnf_path)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (title, orig_name, author, description, lang, favorite, bnf_path))
+            """,
+                (title, orig_name, author, description, lang, favorite, bnf_path),
+            )
             book_id = cur.lastrowid
+
     if tags:
         save_tags(book_id, tags)
     return book_id
@@ -274,7 +324,8 @@ def get_books(filter_text=""):
         cur = conn.cursor()
         if filter_text:
             f = filter_text.casefold()
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT DISTINCT books.*
                 FROM books
                 LEFT JOIN book_tags ON books.id = book_tags.book_id
@@ -284,10 +335,13 @@ def get_books(filter_text=""):
                    OR UNI_LOWER(books.author)    LIKE UNI_LOWER(?)
                    OR UNI_LOWER(tags.name)       LIKE UNI_LOWER(?)
                 ORDER BY UNI_LOWER(books.title)
-            """, (f"%{f}%", f"%{f}%", f"%{f}%", f"%{f}%"))
+            """,
+                (f"%{f}%", f"%{f}%", f"%{f}%", f"%{f}%"),
+            )
         else:
             cur.execute("SELECT * FROM books ORDER BY UNI_LOWER(title)")
         return cur.fetchall()
+
 
 def get_book(book_id):
     with db() as conn:
@@ -358,7 +412,7 @@ def open_lang_file(folder, base_name, lang_code, paraline=False):
         return
     try:
         if paraline:
-            subprocess.Popen(  ["/home/nikolay/bin/paraline_qt", file_path])
+            subprocess.Popen(["/home/nikolay/bin/paraline_qt", file_path])
         else:
             subprocess.Popen(["/home/nikolay/bin/md_editor_qt", file_path])
     except Exception as e:
@@ -432,201 +486,385 @@ class WatcherBridge(QObject):
 
 # ---------- Диалог чипсов-тегов ----------
 
+# значения по умолчанию для .bnf
+DEFAULT_BNF = {
+    "title": "",
+    "orig_name": "",
+    "author": "",
+    "lang": "",
+    "tags": [],
+    "favorite": False,
+    "description": "",
+}
 
-class TagChip(QFrame):
-    clicked = Signal(str)
 
-    def __init__(self, tag: str, active: bool, parent=None):
+def _parse_filename_title_author(base: str) -> tuple[str, str]:
+    """Разбор 'Автор - Название' из имени файла.
+    Fallback: возвращает ('', base) если шаблон не распознан."""
+    for sep in (" - ", " — ", "_"):
+        if sep in base:
+            a, t = base.split(sep, 1)
+            return t.strip(), a.strip()
+    return "", base.strip()
+
+
+def _load_tag_history() -> list[str]:
+    path = os.path.join(os.path.expanduser("~"), ".bnf_tag_history.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(t).strip().lower() for t in data if str(t).strip()]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _save_tag_history(tags: list[str]) -> None:
+    path = os.path.join(os.path.expanduser("~"), ".bnf_tag_history.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(set(tags)), f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+class FlowLayout(QLayout):
+    """Layout, который размещает виджеты в несколько строк с переносом."""
+
+    def __init__(self, parent=None, margin=0, spacing=-1):
         super().__init__(parent)
-        self.tag = tag
-        self.active = active
-        self.setCursor(Qt.PointingHandCursor)
-        self._apply_style()
+        self._items = []
+        self._spacing = spacing
+        if margin >= 0:
+            self.setContentsMargins(margin, margin, margin, margin)
 
-        lbl = QLabel(tag, self)
-        lbl.setFont(QFont("Arial", 10))
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(6, 3, 6, 3)
-        lay.addWidget(lbl)
-        self._label = lbl
-        lbl.mousePressEvent = lambda e: self.clicked.emit(self.tag)
-        self.mousePressEvent = lambda e: self.clicked.emit(self.tag)
-        self.enterEvent = lambda e: self._hover(True)
-        self.leaveEvent = lambda e: self._hover(False)
+    def addItem(self, item):
+        self._items.append(item)
 
-    def _apply_style(self, hover=False):
-        if self.active:
-            bg = "#3498db" if hover else "#2980b9"
-            fg = "white"
-        else:
-            bg = "#d5dbdb" if hover else "#ecf0f1"
-            fg = "#2c3e50"
-        self.setStyleSheet(
-            f"QFrame {{ background: {bg}; border: 1px solid #bdc3c7;"
-            f" border-radius: 10px; }}"
-            f"QLabel {{ color: {fg}; background: transparent; }}"
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def spacing(self):
+        if self._spacing >= 0:
+            return self._spacing
+        return (
+            self.parentWidget()
+            and self.parentWidget()
+            .style()
+            .pixelMetric(self.parentWidget().style().PM_LayoutHorizontalSpacing)
+            or 6
         )
 
-    def _hover(self, on):
-        self._apply_style(on)
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        effective_rect = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            item_size = item.sizeHint()
+
+            next_x = x + item_size.width() + spacing
+            if next_x - spacing > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + spacing
+                next_x = x + item_size.width() + spacing
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item_size))
+
+            x = next_x
+            line_height = max(line_height, item_size.height())
+
+        return y + line_height - rect.y() + m.bottom()
+
+
+class TagChip(QWidget):
+    """Виджет-тег в виде 'пилюли'. Кликабельный, меняет цвет."""
+
+    clicked = Signal(str, bool)  # tag_name, is_selected
+
+    def __init__(self, text: str, selected: bool = False, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.selected = selected
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._hover = False
+        self._update_style()
+
+    def _update_style(self):
+        """Обновить стиль и перерисовать."""
+        self.update()  # вызвать перерисовку
+
+    def paintEvent(self, event):
+        """Отрисовка чипа."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if self.selected:
+            if self._hover:
+                bg = QColor("#1557b0")
+            else:
+                bg = QColor("#1a73e8")
+            fg = QColor("white")
+        else:
+            if self._hover:
+                bg = QColor("#d0d0d0")
+            else:
+                bg = QColor("#e0e0e0")
+            fg = QColor("#333")
+
+        # рисуем скруглённый прямоугольник
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(self.rect(), 12, 12)
+
+        # рисуем текст
+        painter.setPen(fg)
+        font = QFont("Segoe UI", 10)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected = not self.selected
+            self._update_style()
+            self.clicked.emit(self.text, self.selected)
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self._update_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._update_style()
+        super().leaveEvent(event)
+
+    def sizeHint(self):
+        font_metrics = self.fontMetrics()
+        text_width = font_metrics.horizontalAdvance(self.text)
+        return QSize(text_width + 24, 28)
 
 
 class MetadataDialog(QDialog):
-    def __init__(self, app: "LibraryApp", book_id: int):
-        super().__init__(app)
-        self.app = app
-        self.book_id = book_id
-        self.setWindowTitle("Метаданные книги")
-        self.resize(1100, 750)
-        self.setModal(True)
+    """Редактор метаданных книги (.bnf).
 
-        book = get_book(book_id)
-        if not book:
-            self.reject()
-            return
-        (_, title, orig_name, author, desc, lang, bnf_path, favorite) = book
-        self.bnf_path = bnf_path
-        self.tags = get_tags_for_book(book_id)
+    schema:
+      title, orig_name, author, lang (статично «en-ru»),
+      tags (list), favorite (bool), description
+    """
 
-        self.all_tags = sorted(app.tag_history[:])
+    def __init__(
+        self,
+        parent,
+        data: dict | None = None,
+        path: str = "",
+        file_base_name: str = "",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Метаданные книги (.bnf)")
+        self.setMinimumWidth(1100)
+        self.setMinimumHeight(800)
+
+        data = {**DEFAULT_BNF, **(data or {})}
+        tags_raw = data.get("tags") or []
+        if isinstance(tags_raw, str):
+            current_tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        elif isinstance(tags_raw, list):
+            current_tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+        else:
+            current_tags = []
+
+        # предзаполнение title/author из имени файла, если поля пусты
+        title = str(data.get("title") or "").strip()
+        author = str(data.get("author") or "").strip()
+        if file_base_name and (not title or not author):
+            parsed_title, parsed_author = _parse_filename_title_author(file_base_name)
+            if not title and parsed_title:
+                title = parsed_title
+            if not author and parsed_author:
+                author = parsed_author
 
         layout = QVBoxLayout(self)
+        if path:
+            layout.addWidget(QLabel(f"Файл: {path}"))
 
-        # --- Форма полей ---
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignLeft)
 
         self.title_edit = QLineEdit(title)
-        self.orig_edit = QLineEdit(orig_name)
-        self.author_edit = QLineEdit(author)
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["en-ru", "ru"])
-        self.lang_combo.setCurrentText(lang if lang in ("en-ru", "ru") else "en-ru")
-        self.fav_check = QCheckBox("В избранном")
-        self.fav_check.setChecked(bool(favorite))
-
         form.addRow("Название:", self.title_edit)
-        if lang != "ru":
-            form.addRow("Оригинальное название:", self.orig_edit)
-        else:
-            self.orig_edit.setVisible(False)
-            form.addRow("", self.orig_edit)
+
+        self.orig_name_edit = QLineEdit(str(data.get("orig_name") or ""))
+        form.addRow("Оригинальное название:", self.orig_name_edit)
+
+        self.author_edit = QLineEdit(author)
         form.addRow("Автор:", self.author_edit)
+
+        # lang — статично en-ru
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["ru", "en-ru"])
+        current_lang = str(data.get("lang") or "en-ru").strip()
+        # если в данных неожиданное значение — оставляем дефолт en-ru
+        self.lang_combo.setCurrentText(
+            current_lang if current_lang in ("ru", "en-ru") else "en-ru"
+        )
         form.addRow("Язык:", self.lang_combo)
-        form.addRow("Избранное:", self.fav_check)
-        layout.addLayout(form)
 
-        # --- Теги ---
-        layout.addWidget(QLabel("Теги:"))
-        self.tag_entry = QLineEdit()
-        self.tag_entry.setPlaceholderText("Введите тег и нажмите Enter")
-        self.tag_entry.returnPressed.connect(self._on_add_tag)
-        layout.addWidget(self.tag_entry)
+        self.favorite_cb = QCheckBox()
+        fav = data.get("favorite")
+        if isinstance(fav, str):
+            fav = fav.lower() in ("1", "true", "yes", "да")
+        self.favorite_cb.setChecked(bool(fav))
+        form.addRow("Избранное", self.favorite_cb)
 
-        chips_scroll = QScrollArea()
-        chips_scroll.setWidgetResizable(True)
-        chips_scroll.setMinimumHeight(180)
-        self.chips_host = QWidget()
-        self.chips_layout = QGridLayout(self.chips_host)
-        self.chips_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.chips_layout.setSpacing(6)
-        chips_scroll.setWidget(self.chips_host)
-        layout.addWidget(chips_scroll)
+        # --- теги: история + чекбоксы + добавление ---
+        tags_box = QGroupBox("Теги")
+        tags_layout = QVBoxLayout(tags_box)
 
-        # --- Описание ---
-        layout.addWidget(QLabel("Описание:"))
-        self.desc_edit = QTextEdit()
-        self.desc_edit.setPlainText(desc)
-        layout.addWidget(self.desc_edit, 1)
+        self.tags_container = QWidget()
+        self.tags_flow = FlowLayout(self.tags_container, margin=4, spacing=4)
+        self.tags_container.setLayout(self.tags_flow)
+        self.tags_container.setMinimumHeight(80)
+        self.tags_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        tags_layout.addWidget(self.tags_container)
 
-        # --- Кнопки ---
-        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Save).setText("Сохранить")
-        btns.button(QDialogButtonBox.Cancel).setText("Отмена")
-        btns.accepted.connect(self._save)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        self._tag_chips: dict[str, TagChip] = {}
 
-        self._rebuild_chips()
-
-    def _rebuild_chips(self):
-        # очистка
-        while self.chips_layout.count():
-            it = self.chips_layout.takeAt(0)
-            w = it.widget()
-            if w:
-                w.deleteLater()
-
-        cols = 8
-        for i, tag in enumerate(self.all_tags):
-            chip = TagChip(tag, tag in self.tags, self.chips_host)
-            chip.clicked.connect(self._toggle_tag)
-            r, c = divmod(i, cols)
-            self.chips_layout.addWidget(chip, r, c)
-
-    def _toggle_tag(self, tag: str):
-        if tag in self.tags:
-            self.tags.remove(tag)
-        else:
-            self.tags.append(tag)
-        self._rebuild_chips()
-
-    def _on_add_tag(self):
-        tag = self.tag_entry.text().strip().lower()
-        if not tag:
-            return
-        if tag not in self.all_tags:
-            self.all_tags.insert(0, tag)
-        if tag not in self.tags:
-            self.tags.append(tag)
-        self.tag_entry.clear()
-        self._rebuild_chips()
-
-    def _save(self):
-        new_title = self.title_edit.text()
-        new_orig = self.orig_edit.text()
-        new_author = self.author_edit.text()
-        new_desc = self.desc_edit.toPlainText().strip()
-        new_lang = self.lang_combo.currentText().strip() or None
-        new_fav = self.fav_check.isChecked()
-
-        self.app._save_tag_history(self.all_tags)
-
-        add_or_update_book(
-            new_title,
-            new_orig,
-            new_author,
-            new_desc,
-            new_lang,
-            new_fav,
-            self.bnf_path,
-            self.tags,
+        history = _load_tag_history()
+        all_known = sorted(
+            set(history) | set(current_tags),
+            key=lambda s: s.casefold(),
         )
 
-        if self.bnf_path and os.path.exists(self.bnf_path):
-            try:
-                with open(self.bnf_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                data.update(
-                    {
-                        "title": new_title,
-                        "orig_name": new_orig,
-                        "author": new_author,
-                        "description": new_desc,
-                        "lang": new_lang,
-                        "favorite": new_fav,
-                        "tags": self.tags,
-                    }
-                )
-                with open(self.bnf_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось обновить .bnf: {e}")
+        for tag in all_known:
+            self._add_tag_chip(tag, tag in current_tags)
 
-        self.app.refresh_book(self.book_id)
-        # if DialogManager:
-        # DialogManager.show_dialog("Сохранено", "Метаданные успешно сохранены.")
-        self.accept()
+        add_row = QHBoxLayout()
+        self.new_tag_edit = QLineEdit()
+        self.new_tag_edit.setPlaceholderText("Новый тег…")
+        self.new_tag_edit.returnPressed.connect(self._add_new_tag)
+        btn_add_tag = QPushButton("Добавить")
+        btn_add_tag.clicked.connect(self._add_new_tag)
+        add_row.addWidget(self.new_tag_edit, 1)
+        add_row.addWidget(btn_add_tag)
+        tags_layout.addLayout(add_row)
+
+        form.addRow(tags_box)
+
+        self.description_edit = QTextEdit()
+        self.description_edit.setPlainText(str(data.get("description") or ""))
+        self.description_edit.setMaximumHeight(120)
+        form.addRow("Описание:", self.description_edit)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def keyPressEvent(self, event):
+        """Обработка Ctrl+S для сохранения."""
+        if (
+            event.modifiers() == Qt.KeyboardModifier.ControlModifier
+            and event.key() == Qt.Key.Key_S
+        ):
+            self.accept()  # эквивалентно нажатию кнопки Save
+            return
+        super().keyPressEvent(event)
+
+    def _add_tag_chip(self, tag: str, selected: bool) -> None:
+        """Добавить чип тега в FlowLayout."""
+        if tag in self._tag_chips:
+            # уже есть — просто обновить состояние
+            chip = self._tag_chips[tag]
+            if chip.selected != selected:
+                chip.selected = selected
+                chip._update_style()
+            return
+
+        chip = TagChip(tag, selected)
+        chip.clicked.connect(self._on_tag_clicked)
+        self._tag_chips[tag] = chip
+        self.tags_flow.addWidget(chip)
+
+    def _on_tag_clicked(self, tag: str, selected: bool) -> None:
+        """Обработчик клика по чипу."""
+        pass  # состояние уже обновлено в TagChip
+
+    def _add_new_tag(self) -> None:
+        text = self.new_tag_edit.text().strip()
+        if not text:
+            return
+        self._add_tag_chip(text, True)
+        self.new_tag_edit.clear()
+
+    def result_data(self) -> dict:
+        selected_tags = [tag for tag, chip in self._tag_chips.items() if chip.selected]
+        all_tags = list(self._tag_chips.keys())
+        lang = self.lang_combo.currentText().strip()
+        if lang not in ("ru", "en-ru"):
+            lang = "en-ru"
+        _save_tag_history(all_tags)
+
+        return {
+            "title": self.title_edit.text().strip(),
+            "orig_name": self.orig_name_edit.text().strip(),
+            "author": self.author_edit.text().strip(),
+            "lang": lang,
+            "tags": selected_tags,
+            "favorite": self.favorite_cb.isChecked(),
+            "description": self.description_edit.toPlainText().strip(),
+        }
 
 
 class ClickableFrame(QFrame):
@@ -847,7 +1085,7 @@ class DetailsPanel(QScrollArea):
         author_row = QHBoxLayout()
         author_row.setSpacing(8)
 
-        is_fav = (favorite == 1)
+        is_fav = favorite == 1
         star = QLabel("★" if is_fav else "☆")
         star.setCursor(Qt.PointingHandCursor)
         star.setToolTip("Убрать из избранного" if is_fav else "Добавить в избранное")
@@ -856,9 +1094,7 @@ class DetailsPanel(QScrollArea):
             f"{'#f1c40f' if is_fav else c['muted']};"
             f" padding: 0 4px;"
         )
-        star.mousePressEvent = (
-            lambda e, bid=book_id: self.app.toggle_favorite(bid)
-        )
+        star.mousePressEvent = lambda e, bid=book_id: self.app.toggle_favorite(bid)
         author_row.addWidget(star)
 
         author_lbl = QLabel(author or "Неизвестный автор")
@@ -989,7 +1225,7 @@ class LibraryApp(QMainWindow):
         self.tag_history = self._load_tag_history()
 
         self._build_ui()
-        check_db_files_exist()
+        # check_db_files_exist()
         self.refresh_books()
 
         # watcher
@@ -1122,7 +1358,7 @@ class LibraryApp(QMainWindow):
             self.details_panel.refresh_theme()
 
     def _on_cell_clicked(self, row: int, col: int):
-        if col != 1:          # колонка "Изб."
+        if col != 1:  # колонка "Изб."
             return
         it = self.table.item(row, 0)
         if not it:
@@ -1352,11 +1588,14 @@ class LibraryApp(QMainWindow):
         self.search_edit.setText(author)
         with db() as conn:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT * FROM books
                 WHERE UNI_LOWER(author) = UNI_LOWER(?)
                 ORDER BY UNI_LOWER(title)
-            """, (author,))
+            """,
+                (author,),
+            )
             books = cur.fetchall()
         self._fill_table(books)
         self.status_label.setText(f"Найдено книг автора '{author}': {len(books)}")
@@ -1365,13 +1604,16 @@ class LibraryApp(QMainWindow):
         self.search_edit.setText(tag)
         with db() as conn:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT books.* FROM books
                 JOIN book_tags ON books.id = book_tags.book_id
                 JOIN tags ON tags.id = book_tags.tag_id
                 WHERE UNI_LOWER(tags.name) = UNI_LOWER(?)
                 ORDER BY UNI_LOWER(books.title)
-            """, (tag,))
+            """,
+                (tag,),
+            )
             books = cur.fetchall()
         self._fill_table(books)
         self.status_label.setText(f"Найдено книг с тегом '{tag}': {len(books)}")
@@ -1395,9 +1637,63 @@ class LibraryApp(QMainWindow):
         elif lang == "en-ru":
             open_lang_file(folder, base_name, "en-ru", True)
 
-    def open_metadata_dialog(self, book_id):
-        dlg = MetadataDialog(self, book_id)
-        dlg.exec()
+    def open_metadata_dialog(self, book_id: int):
+        book = get_book(book_id)
+        if not book:
+            return
+
+        _, title, orig_name, author, desc, lang, bnf_path, favorite = book
+        tags = get_tags_for_book(book_id)
+
+        data = {
+            "title": title or "",
+            "orig_name": orig_name or "",
+            "author": author or "",
+            "lang": lang or "en-ru",
+            "tags": tags,
+            "favorite": bool(favorite),
+            "description": desc or "",
+        }
+
+        base_name = ""
+        if bnf_path:
+            base_name = os.path.splitext(os.path.basename(bnf_path))[0]
+
+        dlg = MetadataDialog(
+            self, data=data, path=bnf_path or "", file_base_name=base_name
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new = dlg.result_data()  # ← чистый dict, никакой записи в БД
+
+        # 1) БД
+        add_or_update_book(
+            new["title"],
+            new["orig_name"],
+            new["author"],
+            new["description"],
+            new["lang"],
+            new["favorite"],
+            bnf_path,
+            new["tags"],
+        )
+
+        # 2) .bnf-файл — синхронизация
+        if bnf_path and os.path.exists(bnf_path):
+            try:
+                with open(bnf_path, "r", encoding="utf-8") as f:
+                    file_data = json.load(f)
+                file_data.update(new)
+                with open(bnf_path, "w", encoding="utf-8") as f:
+                    json.dump(file_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось обновить .bnf: {e}")
+
+        # 3) UI
+        self.refresh_book(book_id)
+        if hasattr(self, "details_panel"):
+            self.details_panel.show_book(book_id)
 
     # ---------- Watcher ----------
 
@@ -1414,10 +1710,14 @@ class LibraryApp(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             add_or_update_book(
-                data.get("title", ""), data.get("orig_name", ""),
-                data.get("author", ""), data.get("description", ""),
-                data.get("lang"), data.get("favorite", False),
-                path, data.get("tags", []),
+                data.get("title", ""),
+                data.get("orig_name", ""),
+                data.get("author", ""),
+                data.get("description", ""),
+                data.get("lang"),
+                data.get("favorite", False),
+                path,
+                data.get("tags", []),
             )
         except Exception as e:
             print(f"watcher parse error: {e}")
