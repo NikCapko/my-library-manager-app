@@ -12,7 +12,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -90,6 +90,16 @@ QLabel { background: transparent; }
 QMenuBar, QMenu { background: #e8ecef; }
 QMenu::item:selected { background: #2980b9; color: white; }
 QCheckBox { background: transparent; }
+#detailsPanel {
+    background: #eef1f4;
+    border-left: 1px solid #d7dde2;
+}
+#detailsPanel > QWidget > QWidget {
+    background: transparent;
+}
+#detailsPanel QScrollBar:vertical {
+    background: #eef1f4;
+}
 """
 
 DARK_QSS = """
@@ -124,6 +134,16 @@ QMenu::item:selected { background: #2980b9; color: white; }
 QCheckBox { background: transparent; }
 QTextBrowser a { color: #5dade2; }
 QToolTip { background: #2a3036; color: #dfe6ec; border: 1px solid #3c444c; }
+#detailsPanel {
+    background: #191d21;
+    border-left: 1px solid #2f363d;
+}
+#detailsPanel > QWidget > QWidget {
+    background: transparent;
+}
+#detailsPanel QScrollBar:vertical {
+    background: #191d21;
+}
 """
 
 
@@ -355,12 +375,9 @@ def open_lang_file(folder, base_name, lang_code, paraline=False):
         return
     try:
         if paraline:
-            subprocess.Popen(
-                ["/home/nikolay/bin/paraline_qt", file_path],
-                cwd="/home/nikolay/Projects/parallel_editor_qt",
-            )
+            subprocess.Popen(  ["/home/nikolay/bin/paraline_qt", file_path])
         else:
-            subprocess.Popen(["ghostwriter", file_path])
+            subprocess.Popen(["/home/nikolay/bin/md_editor_qt", file_path])
     except Exception as e:
         QMessageBox.critical(None, "Ошибка", str(e))
 
@@ -691,12 +708,16 @@ class DetailsPanel(QScrollArea):
         super().__init__()
         self.app = app
         self._current_book_id = None
+        self.setObjectName("detailsPanel")
         self.setWidgetResizable(True)
+        self.setMaximumWidth(500)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self._content = QWidget()
         self._content.setObjectName("detailsContent")
+        self._content.setAttribute(Qt.WA_StyledBackground, True)
+        self._content.setStyleSheet("background: transparent;")  # ← добавить
         self._vbox = QVBoxLayout(self._content)
         self._vbox.setContentsMargins(18, 18, 18, 18)
         self._vbox.setSpacing(10)
@@ -706,29 +727,30 @@ class DetailsPanel(QScrollArea):
 
     # ---------- цвета ----------
     def _colors(self):
-        print("theme=" + str(self.app.dark_theme))
         if self.app.dark_theme:
             return {
                 "text": "#dfe6ec",
                 "muted": "#8b96a0",
                 "accent": "#5dade2",
                 "accent_hover": "#7ec8f0",
-                "card": "#252b31",
-                "border": "#3c444c",
-                "chip": "#2f363d",
+                "card": "#22282e",  # ← чуть светлее панели (#191d21)
+                "border": "#2f363d",
+                "chip": "#2a3036",
                 "chip_active": "#2980b9",
                 "title": "#ffffff",
+                "panel_bg": "#191d21",  # ← для справки (не используется в стилях виджетов)
             }
         return {
             "text": "#2c3e50",
             "muted": "#7f8c8d",
             "accent": "#2471a3",
             "accent_hover": "#1b527a",
-            "card": "#ffffff",
+            "card": "#ffffff",  # ← на светлой панели (#eef1f4) карточка = белая
             "border": "#dfe6ec",
-            "chip": "#ecf0f1",
+            "chip": "#e4e9ec",
             "chip_active": "#2980b9",
             "title": "#1a252f",
+            "panel_bg": "#eef1f4",
         }
 
     # ---------- служебное ----------
@@ -842,9 +864,17 @@ class DetailsPanel(QScrollArea):
         author_row = QHBoxLayout()
         author_row.setSpacing(8)
 
-        star = QLabel("★" if favorite == 1 else "☆")
+        is_fav = (favorite == 1)
+        star = QLabel("★" if is_fav else "☆")
+        star.setCursor(Qt.PointingHandCursor)
+        star.setToolTip("Убрать из избранного" if is_fav else "Добавить в избранное")
         star.setStyleSheet(
-            f"font-size: 20pt; color: {'#f1c40f' if favorite == 1 else c['muted']};"
+            f"font-size: 20pt; color: "
+            f"{'#f1c40f' if is_fav else c['muted']};"
+            f" padding: 0 4px;"
+        )
+        star.mousePressEvent = (
+            lambda e, bid=book_id: self.app.toggle_favorite(bid)
         )
         author_row.addWidget(star)
 
@@ -966,7 +996,9 @@ class LibraryApp(QMainWindow):
         self.library_path = str(base_dir / "library")
         os.makedirs(self.library_path, exist_ok=True)
 
-        self.dark_theme = True
+        # Настройки приложения (тема и т.п.)
+        self.settings = QSettings("BookLibrary", "LibraryManager")
+        self.dark_theme = self.settings.value("ui/dark_theme", False, type=bool)
 
         self.history_path = os.path.join(
             os.path.expanduser("~"), ".bnf_tag_history.json"
@@ -982,8 +1014,6 @@ class LibraryApp(QMainWindow):
         self.watcher.file_changed.connect(self._on_fs_event)
         self.watcher.start()
 
-        self.apply_theme()
-
     # ---------- UI ----------
 
     def _build_ui(self):
@@ -996,8 +1026,10 @@ class LibraryApp(QMainWindow):
         view_menu = menubar.addMenu("Вид")
         self.theme_action = QAction("Тёмная тема", self, checkable=True)
         self.theme_action.setShortcut(QKeySequence("Ctrl+T"))
+        self.theme_action.setChecked(self.dark_theme)  # ← взять из QSettings
         self.theme_action.toggled.connect(self._toggle_theme)
         view_menu.addAction(self.theme_action)
+        self.apply_theme()
 
         # Панель поиска
         top = QHBoxLayout()
@@ -1005,6 +1037,13 @@ class LibraryApp(QMainWindow):
         self.search_edit.setPlaceholderText("Поиск по названию / автору / тегу…")
         self.search_edit.returnPressed.connect(self.refresh_books)
         top.addWidget(self.search_edit, 1)
+
+        self.fav_only = False
+        btn_fav = QPushButton("★")
+        btn_fav.setFixedWidth(40)
+        btn_fav.setCheckable(True)
+        btn_fav.toggled.connect(self._toggle_fav_filter)
+        top.addWidget(btn_fav)
 
         btn_search = QPushButton("🔎")
         btn_search.setFixedWidth(40)
@@ -1058,6 +1097,7 @@ class LibraryApp(QMainWindow):
         self.table.setColumnWidth(7, 200)
         self.table.cellDoubleClicked.connect(self._open_from_table)
         self.table.itemSelectionChanged.connect(self.show_details)
+        self.table.cellClicked.connect(self._on_cell_clicked)
         body.addWidget(self.table, 3)
 
         # Панель деталей
@@ -1076,10 +1116,16 @@ class LibraryApp(QMainWindow):
         self.table.horizontalHeader().sectionClicked.connect(self._sort_column)
         self._sort_orders = {i: True for i in range(8)}
 
+    def _toggle_fav_filter(self, on: bool):
+        self.fav_only = on
+        self.refresh_books()
+
     # ---------- Тема ----------
 
     def _toggle_theme(self, dark: bool):
         self.dark_theme = dark
+        self.settings.setValue("ui/dark_theme", dark)
+        self.settings.sync()
         self.apply_theme()
 
     def apply_theme(self):
@@ -1091,6 +1137,18 @@ class LibraryApp(QMainWindow):
             self.theme_action.setText("Тёмная тема")
         if hasattr(self, "details_panel"):
             self.details_panel.refresh_theme()
+
+    def _on_cell_clicked(self, row: int, col: int):
+        if col != 1:          # колонка "Изб."
+            return
+        it = self.table.item(row, 0)
+        if not it:
+            return
+        try:
+            book_id = int(it.text())
+        except ValueError:
+            return
+        self.toggle_favorite(book_id)
 
     # ---------- Теги-история ----------
 
@@ -1150,6 +1208,8 @@ class LibraryApp(QMainWindow):
     def refresh_books(self):
         selected_id = self._selected_book_id()
         books = get_books(self.search_edit.text())
+        if self.fav_only:
+            books = [b for b in books if b[7] == 1]
         self._fill_table(books)
         if selected_id is not None:
             self._select_by_id(selected_id)
@@ -1182,6 +1242,43 @@ class LibraryApp(QMainWindow):
                 self.table.setItem(row, col, it)
             it.setText(val)
         self.show_details()
+
+    def toggle_favorite(self, book_id: int):
+        """Инвертирует флаг избранного у книги и обновляет UI."""
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE books SET favorite = 1 - favorite WHERE id = ?",
+            (book_id,),
+        )
+        conn.commit()
+        cur.execute("SELECT favorite FROM books WHERE id = ?", (book_id,))
+        row = cur.fetchone()
+        conn.close()
+
+        if row is None:
+            return
+
+        new_fav = bool(row[0])
+
+        # синхронизируем .bnf, если он есть
+        book = get_book(book_id)
+        if book:
+            bnf_path = book[6]
+            if bnf_path and os.path.exists(bnf_path):
+                try:
+                    with open(bnf_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    data["favorite"] = new_fav
+                    with open(bnf_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"Не удалось обновить .bnf: {e}")
+
+        # обновляем строку в таблице и панель деталей
+        self.refresh_book(book_id)
+        if hasattr(self, "details_panel"):
+            self.details_panel.show_book(book_id)
 
     def _row_for_id(self, book_id):
         for r in range(self.table.rowCount()):
