@@ -550,49 +550,118 @@ class ScanWorker(QObject):
 
 
 # ---------- Watcher-адаптер ----------
-
-
 class WatcherBridge(QObject):
-    """Мост между потоком watchdog и Qt-сигналами."""
+    """Мост между потоком watchdog и Qt-сигналами.
 
-    file_changed = Signal(str)  # путь к изменённому .bnf
+    - Оборачивает LibraryWatcher (который кладёт события в queue.Queue).
+    - Опрашивает очередь из GUI-потока через QTimer.
+    - Дебаунсит: события по одному пути в течение DEBOUNCE_MS сливаются в одно.
+    - Гарантированно не падает на неожиданном формате элемента очереди.
+    """
 
-    def __init__(self, path: str):
-        super().__init__()
+    file_changed = Signal(str)
+    DEBOUNCE_MS = 400
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
         self._path = path
         self._observer = None
-        self._pending: dict[str, float] = {}  # path -> deadline
+        self._queue: queue.Queue = queue.Queue()
+        self._handler = None
+        self._pending: dict[str, float] = {}
+        # ВАЖНО: храним таймер как атрибут, иначе GC убьёт его сразу после start()
+        self._timer = QTimer(self)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self._poll)
 
+    # ---------- жизненный цикл ----------
     def start(self):
         if LibraryWatcher is None:
+            print("[watcher] LibraryWatcher не импортирован — пропуск")
             return
-        self._queue = queue.Queue()
-        handler = LibraryWatcher(self._queue)
+
+        # 1) создаём handler и observer
+        self._handler = LibraryWatcher(self._queue)
         self._observer = Observer()
-        self._observer.schedule(handler, self._path, recursive=True)
+        self._observer.schedule(self._handler, self._path, recursive=True)
 
-        def _run():
-            self._observer.start()
+        # 2) observer.start() в отдельном потоке (он блокирующий)
+        threading.Thread(
+            target=self._observer.start,
+            name="watchdog-observer",
+            daemon=True,
+        ).start()
 
-        threading.Thread(target=_run, daemon=True).start()
+        # 3) запускаем polling в GUI-потоке
+        self._timer.start()
+        print(f"[watcher] started on {self._path}")
 
-        # Polling из GUI-потока
-        self._timer = QTimer()
-        self._timer.timeout.connect(self._poll)
-        self._timer.start(300)
+    def stop(self):
+        self._timer.stop()
+        if self._observer:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=2)
+            except Exception as e:
+                print(f"[watcher] stop error: {e}")
+            self._observer = None
 
+    # ---------- polling ----------
     def _poll(self):
+        # 1) выгрести всё, что накопилось в очереди, и обновить дедлайны
+        drained = 0
+        while True:
+            try:
+                ev = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+
+            path = self._extract_path(ev)
+            if not path:
+                continue
+
+            # фильтр по расширению (нам интересны только .bnf)
+            if not path.lower().endswith(".bnf"):
+                continue
+
+            self._pending[path] = time.monotonic() + self.DEBOUNCE_MS / 1000.0
+
+        # 2) сбросить «созревшие» пути в сигнал
         now = time.monotonic()
         ready = [p for p, t in self._pending.items() if t <= now]
         for p in ready:
             self._pending.pop(p, None)
-            self.file_changed.emit(p)
+            # print(f"[watcher] emit {p}")
             self.file_changed.emit(p)
 
-    def stop(self):
-        if self._observer:
-            self._observer.stop()
-            self._observer.join(timeout=2)
+    @staticmethod
+    def _extract_path(ev) -> str:
+        """Достаёт путь из элемента очереди в любом разумном формате.
+
+        Поддерживает:
+          - (event_type, path)   — кортеж/список из 2 элементов
+          - FileSystemEvent      — watchdog-событие (.src_path)
+          - str                  — голый путь
+          - dict                 — {"path": ...} / {"src_path": ...}
+        """
+        if isinstance(ev, str):
+            return ev
+        if isinstance(ev, (tuple, list)):
+            if len(ev) >= 2:
+                return str(ev[1])
+            if len(ev) == 1:
+                return str(ev[0])
+            return ""
+        if isinstance(ev, dict):
+            return str(ev.get("path") or ev.get("src_path") or "")
+        # watchdog FileSystemEvent
+        src = getattr(ev, "src_path", None)
+        if src:
+            return str(src)
+        # какой-то объект с атрибутом path
+        p = getattr(ev, "path", None)
+        return str(p) if p else ""
 
 
 # ---------- Диалог чипсов-тегов ----------
@@ -1253,6 +1322,9 @@ class DetailsPanel(QScrollArea):
         )
         return lbl
 
+    def current_book_id(self) -> int | None:
+        return self._current_book_id
+
     def _separator(self):
         c = self._colors()
         line = QFrame()
@@ -1820,34 +1892,6 @@ class LibraryApp(QMainWindow):
             self._select_by_id(selected_id)
         self.status_label.setText(f"Найдено книг: {len(books)}")
 
-    def refresh_book(self, book_id):
-        book = get_book(book_id)
-        if not book:
-            return
-        row = self._row_for_id(book_id)
-        if row is None:
-            self.refresh_books()
-            return
-        b_id, title, orig_name, author, desc, lang, bnf_path, favorite = book
-        tags = ", ".join(get_tags_for_book(b_id))
-        values = [
-            str(b_id),
-            self._check_favorite(favorite),
-            author or "",
-            title or "",
-            orig_name or "",
-            lang or "",
-            desc or "",
-            tags,
-        ]
-        for col, val in enumerate(values):
-            it = self.table.item(row, col)
-            if it is None:
-                it = QTableWidgetItem()
-                self.table.setItem(row, col, it)
-            it.setText(val)
-        self.show_details()
-
     def toggle_favorite(self, book_id: int):
         with db() as conn:
             cur = conn.cursor()
@@ -1874,7 +1918,7 @@ class LibraryApp(QMainWindow):
             except Exception as e:
                 print(f"Не удалось обновить .bnf: {e}")
 
-        self.refresh_book(book_id)
+        self._refresh_book_if_visible(book_id)
         if hasattr(self, "details_panel"):
             self.details_panel.show_book(book_id)
 
@@ -2056,7 +2100,7 @@ class LibraryApp(QMainWindow):
                 QMessageBox.critical(self, "Ошибка", f"Не удалось обновить .bnf: {e}")
 
         # 3) UI
-        self.refresh_book(book_id)
+        self._refresh_book_if_visible(book_id)
         if hasattr(self, "details_panel"):
             self.details_panel.show_book(book_id)
 
@@ -2066,18 +2110,20 @@ class LibraryApp(QMainWindow):
         self._ignore_paths[path] = time.monotonic() + sec
 
     def _on_fs_event(self, path: str):
-        until = self._ignore_paths.get(path, 0)
-        if time.monotonic() < until:
-            return
-
+        print(f"_on_fs_event path={path}")
+        # 1) найти книгу по bnf_path
         with db() as conn:
             cur = conn.cursor()
             cur.execute("SELECT id FROM books WHERE bnf_path=?", (path,))
             row = cur.fetchone()
 
         if not row:
-            return
+            print("not found")
+            return  # файл не из библиотеки — игнор
 
+        book_id = row[0]
+        print(f"found book_id={book_id}")
+        # 2) перечитать .bnf и обновить БД
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2095,7 +2141,40 @@ class LibraryApp(QMainWindow):
             print(f"watcher parse error: {e}")
             return
 
-        self.refresh_book(row[0])
+        # 3) обновить UI
+        self._refresh_book_if_visible(book_id)
+
+    def _refresh_book_if_visible(self, book_id: int):
+        row = self._row_for_id(book_id)
+        if row is not None:
+            book = get_book(book_id)
+            if book:
+                b_id, title, orig_name, author, desc, lang, bnf_path, favorite = book
+                tags = ", ".join(get_tags_for_book(b_id))
+                new_values = [
+                    str(b_id),
+                    self._check_favorite(favorite),
+                    author or "",
+                    title or "",
+                    orig_name or "",
+                    lang or "",
+                    desc or "",
+                    tags,
+                ]
+                for col, val in enumerate(new_values):
+                    it = self.table.item(row, col)
+                    if it is None:
+                        it = QTableWidgetItem()
+                        self.table.setItem(row, col, it)
+                        it.setText(val)
+                    elif it.text() != val:
+                        it.setText(val)
+
+        # --- панель деталей ---
+        # Показываем только если открыта именно эта книга.
+        if getattr(self, "details_panel", None) is not None:
+            if self.details_panel.current_book_id() == book_id:
+                self.details_panel.show_book(book_id)
 
     # ---------- Сканирование ----------
 
