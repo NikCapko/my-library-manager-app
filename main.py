@@ -216,24 +216,6 @@ def init_db():
         """)
 
 
-def save_tags(book_id, tags):
-    with db() as conn:
-        cur = conn.cursor()
-        # синхронизируем набор: удаляем лишние, добавляем недостающие
-        cur.execute("DELETE FROM book_tags WHERE book_id=?", (book_id,))
-        for tag in tags:
-            tag = tag.strip()
-            if not tag:
-                continue
-            cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
-            cur.execute("SELECT id FROM tags WHERE name=?", (tag,))
-            tag_id = cur.fetchone()[0]
-            cur.execute(
-                "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?, ?)",
-                (book_id, tag_id),
-            )
-
-
 def get_tags_for_book(book_id):
     with db() as conn:
         cur = conn.cursor()
@@ -263,63 +245,53 @@ def find_book_id(title, author):
         return row[0] if row else None
 
 
-def add_or_update_book(
-    title,
-    orig_name,
-    author,
-    description,
-    lang=None,
-    favorite=False,
-    bnf_path=None,
-    tags=None,
-):
-    # 1) приоритет — уникальный путь к файлу
-    book_id = None
-    if bnf_path:
-        with db() as conn:
-            cur = conn.cursor()
+def add_or_update_book(title, orig_name, author, description, lang=None,
+                       favorite=False, bnf_path=None, tags=None):
+    with db() as conn:
+        cur = conn.cursor()
+        book_id = None
+        if bnf_path:
             cur.execute("SELECT id FROM books WHERE bnf_path=?", (bnf_path,))
             row = cur.fetchone()
             if row:
                 book_id = row[0]
+        if book_id is None:
+            cur.execute(
+                "SELECT id FROM books WHERE UNI_LOWER(title)=UNI_LOWER(?) "
+                "AND UNI_LOWER(author)=UNI_LOWER(?)",
+                (title, author),
+            )
+            row = cur.fetchone()
+            if row:
+                book_id = row[0]
 
-    # 2) fallback — по title+author (для импорта «с нуля» без файла)
-    if book_id is None:
-        book_id = find_book_id(title, author)
-
-    with db() as conn:
-        cur = conn.cursor()
         if book_id:
-            cur.execute(
-                """
-                UPDATE books SET title=?, orig_name=?, author=?, description=?,
-                                 lang=?, favorite=?, bnf_path=? WHERE id=?
-            """,
-                (
-                    title,
-                    orig_name,
-                    author,
-                    description,
-                    lang,
-                    favorite,
-                    bnf_path,
-                    book_id,
-                ),
-            )
+            cur.execute("""UPDATE books SET title=?, orig_name=?, author=?,
+                           description=?, lang=?, favorite=?, bnf_path=? WHERE id=?""",
+                        (title, orig_name, author, description, lang, favorite, bnf_path, book_id))
         else:
-            cur.execute(
-                """
-                INSERT INTO books (title, orig_name, author, description, lang, favorite, bnf_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (title, orig_name, author, description, lang, favorite, bnf_path),
-            )
+            cur.execute("""INSERT INTO books (title, orig_name, author, description,
+                           lang, favorite, bnf_path) VALUES (?,?,?,?,?,?,?)""",
+                        (title, orig_name, author, description, lang, favorite, bnf_path))
             book_id = cur.lastrowid
 
-    if tags:
-        save_tags(book_id, tags)
+        if tags is not None:
+            _replace_tags(cur, book_id, tags)   # синхронно, в этой же транзакции
+
     return book_id
 
+
+def _replace_tags(cur, book_id, tags):
+    cur.execute("DELETE FROM book_tags WHERE book_id=?", (book_id,))
+    for tag in tags:
+        tag = tag.strip()
+        if not tag:
+            continue
+        cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
+        cur.execute("SELECT id FROM tags WHERE name=?", (tag,))
+        tag_id = cur.fetchone()[0]
+        cur.execute("INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?,?)",
+                    (book_id, tag_id))
 
 def get_books(filter_text=""):
     with db() as conn:
