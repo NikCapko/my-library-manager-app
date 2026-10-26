@@ -15,7 +15,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -45,7 +53,6 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QTextEdit,
     QToolButton,
-    # QShortcut,
     QVBoxLayout,
     QWidget,
 )
@@ -1409,6 +1416,113 @@ class LibraryApp(QMainWindow):
         # сортировка по клику на заголовок
         self.table.horizontalHeader().sectionClicked.connect(self._sort_column)
         self._sort_orders = {i: True for i in range(8)}
+
+        self._install_shortcuts()
+
+    def _install_shortcuts(self):
+        """Глобальные горячие клавиши для главного окна."""
+
+        # F5 — обновить список
+        QShortcut(QKeySequence("F5"), self, activated=self.refresh_books)
+
+        # Ctrl+F — фокус в поиск + выделить всё
+        QShortcut(
+            QKeySequence("Ctrl+F"),
+            self,
+            activated=lambda: (
+                self.search_edit.setFocus(),
+                self.search_edit.selectAll(),
+            ),
+        )
+
+        # Esc — очистить поиск (только если фокус не в полях ввода)
+        QShortcut(
+            QKeySequence("Esc"),
+            self,
+            activated=self._on_esc,
+        )
+
+        # Ctrl+E — редактировать метаданные выбранной книги
+        QShortcut(
+            QKeySequence("Ctrl+E"),
+            self,
+            activated=self._edit_selected,
+        )
+
+        # Ctrl+O — открыть файл выбранной книги
+        QShortcut(
+            QKeySequence("Ctrl+O"),
+            self,
+            activated=self._open_from_table,
+        )
+
+        # Del — удалить запись из библиотеки (с подтверждением)
+        QShortcut(
+            QKeySequence("Del"),
+            self,
+            activated=self._delete_selected,
+        )
+
+        QShortcut(QKeySequence("F1"), self, activated=self._show_shortcuts)
+
+    def _on_esc(self):
+        """Esc: очищает поиск, но не мешает закрытию диалогов/меню."""
+        # Если фокус в QLineEdit/QTextEdit — Esc там нужен для локальных действий,
+        # но мы всё равно очищаем поиск — это ожидаемо для «списка книг».
+        if self.search_edit.text():
+            self.reset_search()
+            self.search_edit.setFocus()
+
+    def _edit_selected(self):
+        book_id = self._selected_book_id()
+        if book_id is None:
+            self.status_label.setText("Ничего не выбрано")
+            return
+        self.open_metadata_dialog(book_id)
+
+    def _delete_selected(self):
+        book_id = self._selected_book_id()
+        if book_id is None:
+            return
+
+        book = get_book(book_id)
+        if not book:
+            return
+        _, title, orig_name, author, desc, lang, bnf_path, favorite = book
+        display = title or orig_name or "(без названия)"
+
+        ans = QMessageBox.question(
+            self,
+            "Удалить из библиотеки?",
+            f"Удалить «{display}» из библиотеки?\n\n"
+            f"Файл на диске: {bnf_path or '—'}\n\n"
+            "Сам .bnf-файл НЕ удаляется, только запись в БД.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM books WHERE id=?", (book_id,))
+
+        self.refresh_books()
+        self.status_label.setText(f"Удалено: {display}")
+
+    def _show_shortcuts(self):
+        QMessageBox.information(
+            self,
+            "Горячие клавиши",
+            "F5           — обновить список\n"
+            "Ctrl+F       — фокус в поиск\n"
+            "Esc          — очистить поиск\n"
+            "Ctrl+E       — редактировать метаданные\n"
+            "Ctrl+O       — открыть файл книги\n"
+            "Del          — удалить из библиотеки\n"
+            "Ctrl+T       — переключить тему\n"
+            "Enter/двойной клик — открыть книгу",
+        )
 
     def _toggle_fav_filter(self, on: bool):
         self.fav_only = on
