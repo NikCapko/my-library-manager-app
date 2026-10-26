@@ -157,6 +157,9 @@ QToolTip { background: #2a3036; color: #dfe6ec; border: 1px solid #3c444c; }
 
 def connect():
     conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=3000")
 
     def _cmp(a, b):
         a = "" if a is None else str(a)
@@ -245,8 +248,16 @@ def find_book_id(title, author):
         return row[0] if row else None
 
 
-def add_or_update_book(title, orig_name, author, description, lang=None,
-                       favorite=False, bnf_path=None, tags=None):
+def add_or_update_book(
+    title,
+    orig_name,
+    author,
+    description,
+    lang=None,
+    favorite=False,
+    bnf_path=None,
+    tags=None,
+):
     with db() as conn:
         cur = conn.cursor()
         book_id = None
@@ -266,17 +277,30 @@ def add_or_update_book(title, orig_name, author, description, lang=None,
                 book_id = row[0]
 
         if book_id:
-            cur.execute("""UPDATE books SET title=?, orig_name=?, author=?,
+            cur.execute(
+                """UPDATE books SET title=?, orig_name=?, author=?,
                            description=?, lang=?, favorite=?, bnf_path=? WHERE id=?""",
-                        (title, orig_name, author, description, lang, favorite, bnf_path, book_id))
+                (
+                    title,
+                    orig_name,
+                    author,
+                    description,
+                    lang,
+                    favorite,
+                    bnf_path,
+                    book_id,
+                ),
+            )
         else:
-            cur.execute("""INSERT INTO books (title, orig_name, author, description,
+            cur.execute(
+                """INSERT INTO books (title, orig_name, author, description,
                            lang, favorite, bnf_path) VALUES (?,?,?,?,?,?,?)""",
-                        (title, orig_name, author, description, lang, favorite, bnf_path))
+                (title, orig_name, author, description, lang, favorite, bnf_path),
+            )
             book_id = cur.lastrowid
 
         if tags is not None:
-            _replace_tags(cur, book_id, tags)   # синхронно, в этой же транзакции
+            _replace_tags(cur, book_id, tags)  # синхронно, в этой же транзакции
 
     return book_id
 
@@ -290,8 +314,11 @@ def _replace_tags(cur, book_id, tags):
         cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
         cur.execute("SELECT id FROM tags WHERE name=?", (tag,))
         tag_id = cur.fetchone()[0]
-        cur.execute("INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?,?)",
-                    (book_id, tag_id))
+        cur.execute(
+            "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?,?)",
+            (book_id, tag_id),
+        )
+
 
 def get_books(filter_text=""):
     with db() as conn:
@@ -483,6 +510,7 @@ class WatcherBridge(QObject):
         super().__init__()
         self._path = path
         self._observer = None
+        self._pending: dict[str, float] = {}  # path -> deadline
 
     def start(self):
         if LibraryWatcher is None:
@@ -503,17 +531,12 @@ class WatcherBridge(QObject):
         self._timer.start(300)
 
     def _poll(self):
-        try:
-            while True:
-                ev = self._queue.get_nowait()
-                # ev может быть (event_type, path) или просто path
-                if isinstance(ev, (tuple, list)) and len(ev) == 2:
-                    _, p = ev
-                else:
-                    p = str(ev)
-                self.file_changed.emit(p)
-        except queue.Empty:
-            pass
+        now = time.monotonic()
+        ready = [p for p, t in self._pending.items() if t <= now]
+        for p in ready:
+            self._pending.pop(p, None)
+            self.file_changed.emit(p)
+            self.file_changed.emit(p)
 
     def stop(self):
         if self._observer:
@@ -1267,6 +1290,8 @@ class LibraryApp(QMainWindow):
         # check_db_files_exist()
         self.refresh_books()
 
+        self._ignore_paths: dict[str, float] = {}  # path -> until
+
         # watcher
         self.watcher = WatcherBridge(self.library_path)
         self.watcher.file_changed.connect(self._on_fs_event)
@@ -1533,6 +1558,7 @@ class LibraryApp(QMainWindow):
                     data = json.load(f)
                 data["favorite"] = new_fav
                 with open(book[6], "w", encoding="utf-8") as f:
+                    self._ignore_for(bnf_path)
                     json.dump(data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f"Не удалось обновить .bnf: {e}")
@@ -1736,6 +1762,7 @@ class LibraryApp(QMainWindow):
                     file_data = json.load(f)
                 file_data.update(new)
                 with open(bnf_path, "w", encoding="utf-8") as f:
+                    self._ignore_for(bnf_path)
                     json.dump(file_data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 QMessageBox.critical(self, "Ошибка", f"Не удалось обновить .bnf: {e}")
@@ -1747,7 +1774,14 @@ class LibraryApp(QMainWindow):
 
     # ---------- Watcher ----------
 
+    def _ignore_for(self, path, sec=1.0):
+        self._ignore_paths[path] = time.monotonic() + sec
+
     def _on_fs_event(self, path: str):
+        until = self._ignore_paths.get(path, 0)
+        if time.monotonic() < until:
+            return
+
         with db() as conn:
             cur = conn.cursor()
             cur.execute("SELECT id FROM books WHERE bnf_path=?", (path,))
