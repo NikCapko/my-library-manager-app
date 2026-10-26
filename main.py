@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
@@ -327,27 +328,70 @@ def _replace_tags(cur, book_id, tags):
         )
 
 
-def get_books(filter_text=""):
+@dataclass
+class Filters:
+    text: str = ""  # свободный поиск
+    author: str | None = None  # точное совпадение (регистронезависимо)
+    tags: list[str] = field(default_factory=list)  # все должны присутствовать (AND)
+    lang: str | None = None  # "ru" | "en-ru"
+    favorite_only: bool = False
+
+    def is_empty(self) -> bool:
+        return not (
+            self.text or self.author or self.tags or self.lang or self.favorite_only
+        )
+
+
+def get_books(filters: Filters | None = None):
+    filters = filters or Filters()
+    where, params = [], []
+
+    if filters.text:
+        f = f"%{filters.text.casefold()}%"
+        where.append("""
+            (UNI_LOWER(books.title)     LIKE UNI_LOWER(?)
+             OR UNI_LOWER(books.orig_name) LIKE UNI_LOWER(?)
+             OR UNI_LOWER(books.author)    LIKE UNI_LOWER(?)
+             OR EXISTS (
+                 SELECT 1 FROM book_tags bt
+                 JOIN tags t ON t.id = bt.tag_id
+                 WHERE bt.book_id = books.id
+                   AND UNI_LOWER(t.name) LIKE UNI_LOWER(?)
+             ))
+        """)
+        params += [f, f, f, f]
+
+    if filters.author:
+        where.append("UNI_LOWER(books.author) = UNI_LOWER(?)")
+        params.append(filters.author)
+
+    if filters.lang:
+        where.append("books.lang = ?")
+        params.append(filters.lang)
+
+    if filters.favorite_only:
+        where.append("books.favorite = 1")
+
+    # каждый тег — отдельный EXISTS (AND по тегам)
+    for tag in filters.tags:
+        where.append("""
+            EXISTS (
+                SELECT 1 FROM book_tags bt
+                JOIN tags t ON t.id = bt.tag_id
+                WHERE bt.book_id = books.id
+                  AND UNI_LOWER(t.name) = UNI_LOWER(?)
+            )
+        """)
+        params.append(tag)
+
+    sql = "SELECT books.* FROM books"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY UNI_LOWER(books.title)"
+
     with db() as conn:
         cur = conn.cursor()
-        if filter_text:
-            f = filter_text.casefold()
-            cur.execute(
-                """
-                SELECT DISTINCT books.*
-                FROM books
-                LEFT JOIN book_tags ON books.id = book_tags.book_id
-                LEFT JOIN tags ON tags.id = book_tags.tag_id
-                WHERE UNI_LOWER(books.title)     LIKE UNI_LOWER(?)
-                   OR UNI_LOWER(books.orig_name) LIKE UNI_LOWER(?)
-                   OR UNI_LOWER(books.author)    LIKE UNI_LOWER(?)
-                   OR UNI_LOWER(tags.name)       LIKE UNI_LOWER(?)
-                ORDER BY UNI_LOWER(books.title)
-            """,
-                (f"%{f}%", f"%{f}%", f"%{f}%", f"%{f}%"),
-            )
-        else:
-            cur.execute("SELECT * FROM books ORDER BY UNI_LOWER(title)")
+        cur.execute(sql, params)
         return cur.fetchall()
 
 
@@ -989,6 +1033,150 @@ class ClickableFrame(QFrame):
         self._apply_style(hover=False)
 
 
+class ActiveFiltersBar(QWidget):
+    """Полоска активных фильтров-чипсов + кнопка 'Сбросить всё'."""
+
+    changed = Signal()  # фильтр изменился
+    request_edit_author = Signal()  # клик по чипсу автора — открыть диалог? (опц.)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filters = Filters()
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(6)
+        self._layout.addStretch()
+        self.setVisible(False)
+
+    def filters(self) -> Filters:
+        return self._filters
+
+    def set_filters(self, f: Filters):
+        self._filters = f
+        self._rebuild()
+        self.changed.emit()
+
+    def remove_tag(self, tag: str):
+        self._filters.tags = [t for t in self._filters.tags if t != tag]
+        QTimer.singleShot(0, self._rebuild_and_emit)
+
+    def remove_author(self):
+        self._filters.author = None
+        QTimer.singleShot(0, self._rebuild_and_emit)
+
+    def remove_lang(self):
+        self._filters.lang = None
+        QTimer.singleShot(0, self._rebuild_and_emit)
+
+    def set_favorite_only(self, on: bool):
+        self._filters.favorite_only = on
+        QTimer.singleShot(0, self._rebuild_and_emit)
+
+    def clear(self):
+        self._filters = Filters()
+        QTimer.singleShot(0, self._rebuild_and_emit)
+
+    def _rebuild_and_emit(self):
+        self._rebuild()
+        self.changed.emit()
+
+    def _rebuild(self):
+        # очистить всё, кроме stretch в конце
+        while self._layout.count():
+            it = self._layout.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+        c = self._colors()
+        f = self._filters
+
+        if f.author:
+            self._layout.addWidget(
+                self._make_chip(f"Автор: {f.author}", c, lambda: self.remove_author())
+            )
+        for tag in f.tags:
+            self._layout.addWidget(
+                self._make_chip(
+                    f"#{tag}", c, lambda _checked=False, t=tag: self.remove_tag(t)
+                )
+            )
+        if f.lang:
+            self._layout.addWidget(
+                self._make_chip(f"Язык: {f.lang}", c, lambda: self.remove_lang())
+            )
+        if f.favorite_only:
+            self._layout.addWidget(
+                self._make_chip("★ Избранное", c, lambda: self.set_favorite_only(False))
+            )
+
+        self._layout.addStretch()
+
+        if not f.is_empty():
+            btn = QPushButton("Сбросить всё")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFlat(True)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {c["muted"]}; background: transparent;
+                    border: none; text-decoration: underline;
+                    font-size: 10pt; padding: 2px 8px;
+                }}
+                QPushButton:hover {{ color: {c["accent"]}; }}
+            """)
+            btn.clicked.connect(self.clear)
+            self._layout.addWidget(btn)
+
+        self.setVisible(not f.is_empty())
+
+    def _make_chip(self, text: str, c: dict, on_remove):
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background: {c["chip"]};
+                border: 1px solid {c["border"]};
+                border-radius: 11px;
+            }}
+            QLabel {{ background: transparent; color: {c["text"]}; font-size: 10pt; }}
+            QToolButton {{
+                background: transparent; border: none;
+                color: {c["muted"]}; font-size: 12pt; padding: 0 2px;
+            }}
+            QToolButton:hover {{ color: {c["accent"]}; }}
+        """)
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(10, 2, 4, 2)
+        lay.setSpacing(4)
+        lay.addWidget(QLabel(text))
+        btn = QToolButton()
+        btn.setText("×")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(on_remove)
+        lay.addWidget(btn)
+        return frame
+
+    def _colors(self):
+        app = self.window()
+        dark = getattr(app, "dark_theme", False)
+        if dark:
+            return {
+                "text": "#dfe6ec",
+                "muted": "#8b96a0",
+                "accent": "#5dade2",
+                "card": "#252b31",
+                "border": "#3c444c",
+                "chip": "#2f363d",
+            }
+        return {
+            "text": "#2c3e50",
+            "muted": "#7f8c8d",
+            "accent": "#2471a3",
+            "card": "#ffffff",
+            "border": "#dfe6ec",
+            "chip": "#ecf0f1",
+        }
+
+
 class DetailsPanel(QScrollArea):
     """Панель деталей книги: карточки, заголовки, чипсы, действия."""
 
@@ -1325,19 +1513,20 @@ class LibraryApp(QMainWindow):
         top = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Поиск по названию / автору / тегу…")
-        self.search_edit.returnPressed.connect(self.refresh_books)
+        self.search_edit.returnPressed.connect(self._apply_text_search)
         top.addWidget(self.search_edit, 1)
 
         self.fav_only = False
         btn_fav = QPushButton("★")
         btn_fav.setFixedWidth(40)
         btn_fav.setCheckable(True)
+        btn_fav.setToolTip("Только избранное")
         btn_fav.toggled.connect(self._toggle_fav_filter)
         top.addWidget(btn_fav)
 
         btn_search = QPushButton("🔎")
         btn_search.setFixedWidth(40)
-        btn_search.clicked.connect(self.refresh_books)
+        btn_search.clicked.connect(self._apply_text_search)
         top.addWidget(btn_search)
 
         btn_clear = QPushButton("❌")
@@ -1350,6 +1539,10 @@ class LibraryApp(QMainWindow):
         top.addWidget(btn_scan)
 
         root.addLayout(top)
+
+        self.filters_bar = ActiveFiltersBar(self)
+        self.filters_bar.changed.connect(self.refresh_books)
+        root.addWidget(self.filters_bar)
 
         # Основная область: таблица + детали
         body = QHBoxLayout()
@@ -1418,6 +1611,11 @@ class LibraryApp(QMainWindow):
         self._sort_orders = {i: True for i in range(8)}
 
         self._install_shortcuts()
+
+    def _apply_text_search(self):
+        f = self.filters_bar.filters()
+        f.text = self.search_edit.text().strip()
+        self.filters_bar.set_filters(f)
 
     def _install_shortcuts(self):
         """Глобальные горячие клавиши для главного окна."""
@@ -1525,8 +1723,7 @@ class LibraryApp(QMainWindow):
         )
 
     def _toggle_fav_filter(self, on: bool):
-        self.fav_only = on
-        self.refresh_books()
+        self.filters_bar.set_favorite_only(on)
 
     # ---------- Тема ----------
 
@@ -1545,6 +1742,8 @@ class LibraryApp(QMainWindow):
             self.theme_action.setText("Тёмная тема")
         if hasattr(self, "details_panel"):
             self.details_panel.refresh_theme()
+        if hasattr(self, "filters_bar"):
+            self.filters_bar._rebuild()
 
     def _on_cell_clicked(self, row: int, col: int):
         if col != 1:  # колонка "Изб."
@@ -1615,9 +1814,7 @@ class LibraryApp(QMainWindow):
 
     def refresh_books(self):
         selected_id = self._selected_book_id()
-        books = get_books(self.search_edit.text())
-        if self.fav_only:
-            books = [b for b in books if b[7] == 1]
+        books = get_books(self.filters_bar.filters())
         self._fill_table(books)
         if selected_id is not None:
             self._select_by_id(selected_id)
@@ -1774,39 +1971,16 @@ class LibraryApp(QMainWindow):
         elif code == "en-ru":
             open_lang_file(folder, base_name, "en-ru", True)
 
-    def search_by_author(self, author):
-        self.search_edit.setText(author)
-        with db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT * FROM books
-                WHERE UNI_LOWER(author) = UNI_LOWER(?)
-                ORDER BY UNI_LOWER(title)
-            """,
-                (author,),
-            )
-            books = cur.fetchall()
-        self._fill_table(books)
-        self.status_label.setText(f"Найдено книг автора '{author}': {len(books)}")
+    def search_by_author(self, author: str):
+        f = self.filters_bar.filters()
+        f.author = author
+        self.filters_bar.set_filters(f)  # это вызовет refresh_books через signal
 
-    def search_by_tag(self, tag):
-        self.search_edit.setText(tag)
-        with db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT books.* FROM books
-                JOIN book_tags ON books.id = book_tags.book_id
-                JOIN tags ON tags.id = book_tags.tag_id
-                WHERE UNI_LOWER(tags.name) = UNI_LOWER(?)
-                ORDER BY UNI_LOWER(books.title)
-            """,
-                (tag,),
-            )
-            books = cur.fetchall()
-        self._fill_table(books)
-        self.status_label.setText(f"Найдено книг с тегом '{tag}': {len(books)}")
+    def search_by_tag(self, tag: str):
+        f = self.filters_bar.filters()
+        if tag not in f.tags:
+            f.tags = f.tags + [tag]
+        self.filters_bar.set_filters(f)
 
     # ---------- Открытие из списка ----------
 
