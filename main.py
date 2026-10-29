@@ -560,7 +560,7 @@ class WatcherBridge(QObject):
     """
 
     file_changed = Signal(str)
-    DEBOUNCE_MS = 400
+    DEBOUNCE_MS = 1000
 
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
@@ -888,7 +888,7 @@ class MetadataDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Метаданные книги (.bnf)")
         self.setMinimumWidth(1100)
-        self.setMinimumHeight(800)
+        self.setMinimumHeight(820)
 
         data = {**DEFAULT_BNF, **(data or {})}
         tags_raw = data.get("tags") or []
