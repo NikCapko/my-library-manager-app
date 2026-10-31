@@ -139,9 +139,10 @@ QHeaderView::section {
     background: #2f363d; color: #dfe6ec; border: none;
     border-bottom: 1px solid #3c444c; padding: 4px; font-weight: bold;
 }
-QScrollBar:vertical { background: #1e2227; width: 12px; }
-QScrollBar::handle:vertical { background: #4a525a; border-radius: 6px; min-height: 20px; }
-QScrollBar::handle:vertical:hover { background: #5a636b; }
+QScrollBar:vertical { background: #1e1e1e; width: 10px; margin: 0 }
+QScrollBar::handle:vertical { background: #3c3c3c; min-height: 20px; border-radius: 5px;}
+QScrollBar::handle:vertical:hover {  background: #505050;}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0;}
 QMenuBar, QMenu { background: #2a3036; color: #dfe6ec; }
 QMenu::item:selected { background: #2980b9; color: white; }
 QCheckBox { background: transparent; }
